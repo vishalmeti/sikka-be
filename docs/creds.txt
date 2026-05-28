@@ -1,0 +1,1 @@
+supabase db = postgresql://postgres:v2IlRHhgKrfOOsEG@db.rmfrkylgcltjokdtswss.supabase.co:5432/postgres
