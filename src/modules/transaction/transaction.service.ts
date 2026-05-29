@@ -147,7 +147,7 @@ export class TransactionService {
 
     const { data, error, count } = await supabaseAdmin
       .from("transactions")
-      .select("*, profiles!customer_id(name, phone)", { count: "exact" })
+      .select("*, profiles!customer_id(name, username)", { count: "exact" })
       .eq("store_id", storeId)
       .order("created_at", { ascending: false })
       .range(from, to);

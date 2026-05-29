@@ -42,9 +42,8 @@ src/
 
 ## API Routes
 All under `/api/`:
-- `POST /auth/send-otp` — send OTP to phone
-- `POST /auth/verify-otp` — verify OTP, get tokens
-- `POST /auth/signup` — register + verify OTP
+- `POST /auth/register` — create account (username + password), get tokens
+- `POST /auth/login` — log in (username + password), get tokens
 - `POST /auth/refresh` — refresh access token
 - `GET /profile` — get current user profile
 - `PUT /profile` — update profile

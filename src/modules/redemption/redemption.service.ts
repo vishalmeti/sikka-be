@@ -159,7 +159,7 @@ export class RedemptionService {
 
     const { data, error, count } = await supabaseAdmin
       .from("redemption_requests")
-      .select("*, profiles!customer_id(name, phone)", { count: "exact" })
+      .select("*, profiles!customer_id(name, username)", { count: "exact" })
       .eq("store_id", storeId)
       .order("requested_at", { ascending: false })
       .range(from, to);
