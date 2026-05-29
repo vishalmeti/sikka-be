@@ -1,4 +1,4 @@
-import { supabaseAdmin } from "../../config";
+import { supabaseAdmin, REDEEM_RATE } from "../../config";
 import { AppError, NotFoundError } from "../../utils/errors";
 import { tierProgress } from "../../utils/tier";
 
@@ -51,10 +51,12 @@ export class WalletService {
   async getDashboard(customerId: string) {
     const { data: wallets } = await supabaseAdmin
       .from("coin_wallets")
-      .select("balance, total_earned, streak_days, stores(name)")
-      .eq("customer_id", customerId);
+      .select("store_id, balance, total_earned, tier, streak_days, stores(id, name)")
+      .eq("customer_id", customerId)
+      .order("balance", { ascending: false });
 
     const totalCoins = (wallets || []).reduce((sum: number, w: any) => sum + Number(w.balance), 0);
+    const totalEarned = (wallets || []).reduce((sum: number, w: any) => sum + Number(w.total_earned), 0);
     const maxStreak = Math.max(0, ...(wallets || []).map((w: any) => w.streak_days));
 
     const { data: profile } = await supabaseAdmin
@@ -62,6 +64,19 @@ export class WalletService {
       .select("name")
       .eq("id", customerId)
       .single();
+
+    // Visit count per store = confirmed transactions, tallied in app code
+    // (Supabase JS has no GROUP BY); fine for MVP transaction volumes.
+    const { data: confirmedTx } = await supabaseAdmin
+      .from("transactions")
+      .select("store_id")
+      .eq("customer_id", customerId)
+      .eq("status", "confirmed");
+
+    const visitsByStore = new Map<string, number>();
+    for (const tx of confirmedTx || []) {
+      visitsByStore.set(tx.store_id, (visitsByStore.get(tx.store_id) || 0) + 1);
+    }
 
     const { data: recentTx } = await supabaseAdmin
       .from("transactions")
@@ -100,11 +115,18 @@ export class WalletService {
     return {
       userName: profile?.name || "User",
       totalCoins,
+      totalEarned,
+      overallProgress: tierProgress(totalEarned),
+      redeemRate: REDEEM_RATE,
       streakDays: maxStreak,
       stores: (wallets || []).map((w: any) => ({
+        id: w.store_id,
         name: w.stores?.name,
         coins: w.balance,
         totalEarned: w.total_earned,
+        tier: w.tier,
+        tierProgress: tierProgress(w.total_earned),
+        visits: visitsByStore.get(w.store_id) || 0,
       })),
       activity: activity.slice(0, 10),
     };

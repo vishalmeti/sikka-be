@@ -10,6 +10,7 @@ router.use(authenticate as any);
 
 router.get("/", controller.listActive as any);
 router.get("/my", requireRole("owner") as any, controller.getMyStores as any);
+router.get("/dashboard", requireRole("owner") as any, controller.getDashboard as any);
 router.get("/lookup/:upiId", controller.getByUpiId as any);
 router.get("/:id", controller.getById as any);
 router.post("/", requireRole("owner") as any, validate(createStoreSchema), controller.create as any);

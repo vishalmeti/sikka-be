@@ -50,6 +50,7 @@ All under `/api/`:
 - `PUT /profile/fcm-token` — update FCM token
 - `GET /stores` — list active stores
 - `GET /stores/my` — owner's stores
+- `GET /stores/dashboard` — owner home dashboard (GMV, visits, redemptions, offer, leaderboard)
 - `GET /stores/lookup/:upiId` — lookup by UPI QR
 - `POST /stores` — create store (owner)
 - `PUT /stores/:id` — update store (owner)

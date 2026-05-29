@@ -43,6 +43,15 @@ export class StoreController {
     }
   }
 
+  async getDashboard(req: AuthenticatedRequest, res: Response, next: NextFunction) {
+    try {
+      const result = await storeService.getOwnerDashboard(req.userId);
+      sendSuccess(res, result);
+    } catch (err) {
+      next(err);
+    }
+  }
+
   async listActive(_req: AuthenticatedRequest, res: Response, next: NextFunction) {
     try {
       const result = await storeService.listActive();
