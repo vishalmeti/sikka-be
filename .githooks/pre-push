@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+#
+# Pre-push hook: run the test suite before allowing a push.
+# Bypass in an emergency with:  git push --no-verify
+set -euo pipefail
+
+echo "[pre-push] sikka-be: running tests before push..."
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "[pre-push] 'npm' not found on PATH — cannot run tests. Push aborted."
+  echo "[pre-push] Push from a terminal where 'npm' works, or bypass with: git push --no-verify"
+  exit 1
+fi
+
+if ! npm test; then
+  echo "[pre-push] Tests failed — push aborted."
+  echo "[pre-push] Fix the failing tests, or bypass with: git push --no-verify"
+  exit 1
+fi
+
+echo "[pre-push] Tests passed — proceeding with push."
