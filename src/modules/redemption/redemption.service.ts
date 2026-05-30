@@ -1,22 +1,39 @@
-import { supabaseAdmin, REDEEM_RATE, MAX_REDEMPTION_PERCENT } from "../../config";
+import {
+  query,
+  queryOne,
+  queryCount,
+  withTx,
+  REDEEM_RATE,
+  MAX_REDEMPTION_PERCENT,
+} from "../../config";
 import { AppError, NotFoundError, ForbiddenError, ValidationError } from "../../utils/errors";
 import { PaginationParams } from "../../types";
-import { paginationRange } from "../../utils/pagination";
 import { NotificationService } from "../notification/notification.service";
 
 const notificationService = new NotificationService();
 
+interface RedemptionRow {
+  id: string;
+  customer_id: string;
+  store_id: string;
+  coins_to_redeem: string;
+  rupee_value: string;
+  bill_amount: string;
+  status: "pending" | "approved" | "rejected";
+  requested_at: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+}
+
 export class RedemptionService {
   async create(customerId: string, storeId: string, coinsToRedeem: number, billAmount: number) {
-    const { data: wallet } = await supabaseAdmin
-      .from("coin_wallets")
-      .select("*")
-      .eq("customer_id", customerId)
-      .eq("store_id", storeId)
-      .single();
+    const wallet = await queryOne<{ id: string; balance: string }>(
+      "SELECT id, balance FROM coin_wallets WHERE customer_id = $1 AND store_id = $2",
+      [customerId, storeId],
+    );
 
     if (!wallet) throw new NotFoundError("Wallet");
-    if (wallet.balance < coinsToRedeem) {
+    if (Number(wallet.balance) < coinsToRedeem) {
       throw new ValidationError("Insufficient coin balance");
     }
 
@@ -25,36 +42,29 @@ export class RedemptionService {
 
     if (rupeeValue > maxDiscount) {
       throw new ValidationError(
-        `Maximum redemption is ₹${maxDiscount.toFixed(2)} (20% of ₹${billAmount})`
+        `Maximum redemption is ₹${maxDiscount.toFixed(2)} (20% of ₹${billAmount})`,
       );
     }
 
-    const { data: redemption, error } = await supabaseAdmin
-      .from("redemption_requests")
-      .insert({
-        customer_id: customerId,
-        store_id: storeId,
-        coins_to_redeem: coinsToRedeem,
-        rupee_value: rupeeValue,
-        bill_amount: billAmount,
-      })
-      .select()
-      .single();
+    const redemption = (await queryOne<RedemptionRow>(
+      `INSERT INTO redemption_requests
+         (customer_id, store_id, coins_to_redeem, rupee_value, bill_amount)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [customerId, storeId, coinsToRedeem, rupeeValue, billAmount],
+    ))!;
 
-    if (error) throw new AppError(400, error.message);
-
-    const { data: store } = await supabaseAdmin
-      .from("stores")
-      .select("owner_id, name")
-      .eq("id", storeId)
-      .single();
+    const store = await queryOne<{ owner_id: string; name: string }>(
+      "SELECT owner_id, name FROM stores WHERE id = $1",
+      [storeId],
+    );
 
     if (store) {
       await notificationService.create(store.owner_id, {
         title: "New Redemption Request",
         body: `A customer wants to redeem ${coinsToRedeem} coins (₹${rupeeValue}) at ${store.name}`,
         type: "redemption_requested",
-        referenceId: redemption!.id,
+        referenceId: redemption.id,
       });
     }
 
@@ -62,58 +72,62 @@ export class RedemptionService {
   }
 
   async resolve(redemptionId: string, ownerId: string, status: "approved" | "rejected") {
-    const { data: redemption } = await supabaseAdmin
-      .from("redemption_requests")
-      .select("*, stores(owner_id, name)")
-      .eq("id", redemptionId)
-      .single();
+    const redemption = await queryOne<RedemptionRow & { store_owner_id: string; store_name: string }>(
+      `SELECT r.*, s.owner_id AS store_owner_id, s.name AS store_name
+       FROM redemption_requests r
+       JOIN stores s ON s.id = r.store_id
+       WHERE r.id = $1`,
+      [redemptionId],
+    );
 
     if (!redemption) throw new NotFoundError("Redemption request");
-    if ((redemption as any).stores?.owner_id !== ownerId) {
+    if (redemption.store_owner_id !== ownerId) {
       throw new ForbiddenError("You don't own this store");
     }
     if (redemption.status !== "pending") {
       throw new ValidationError("Request already resolved");
     }
 
-    const { data: updated, error } = await supabaseAdmin
-      .from("redemption_requests")
-      .update({
-        status,
-        resolved_at: new Date().toISOString(),
-        resolved_by: ownerId,
-      })
-      .eq("id", redemptionId)
-      .select()
-      .single();
+    const updated = await withTx(async (client) => {
+      const updRes = await client.query<RedemptionRow>(
+        `UPDATE redemption_requests
+         SET status = $2, resolved_at = now(), resolved_by = $3
+         WHERE id = $1
+         RETURNING *`,
+        [redemptionId, status, ownerId],
+      );
 
-    if (error) throw new AppError(400, error.message);
-
-    if (status === "approved") {
-      const { data: wallet } = await supabaseAdmin
-        .from("coin_wallets")
-        .select("*")
-        .eq("customer_id", redemption.customer_id)
-        .eq("store_id", redemption.store_id)
-        .single();
-
-      if (wallet) {
-        await supabaseAdmin
-          .from("coin_wallets")
-          .update({ balance: wallet.balance - redemption.coins_to_redeem })
-          .eq("id", wallet.id);
+      if (status === "approved") {
+        // Locking the wallet row prevents a concurrent earn from racing with the debit.
+        const walletRes = await client.query<{ id: string; balance: string }>(
+          "SELECT id, balance FROM coin_wallets WHERE customer_id = $1 AND store_id = $2 FOR UPDATE",
+          [redemption.customer_id, redemption.store_id],
+        );
+        const wallet = walletRes.rows[0];
+        if (wallet) {
+          const newBalance = Number(wallet.balance) - Number(redemption.coins_to_redeem);
+          if (newBalance < 0) throw new ValidationError("Insufficient coin balance");
+          await client.query("UPDATE coin_wallets SET balance = $2 WHERE id = $1", [
+            wallet.id,
+            newBalance,
+          ]);
+        }
       }
 
+      return updRes.rows[0];
+    });
+
+    if (status === "approved") {
       await notificationService.create(redemption.customer_id, {
         title: "Redemption Approved!",
-        body: `Your ₹${redemption.rupee_value} discount at ${(redemption as any).stores?.name} was approved`,
+        body: `Your ₹${redemption.rupee_value} discount at ${redemption.store_name} was approved`,
         type: "redemption_confirmed",
         referenceId: redemptionId,
       });
     } else {
       await notificationService.create(redemption.customer_id, {
         title: "Redemption Rejected",
-        body: `Your redemption request at ${(redemption as any).stores?.name} was rejected`,
+        body: `Your redemption request at ${redemption.store_name} was rejected`,
         type: "redemption_rejected",
         referenceId: redemptionId,
       });
@@ -123,56 +137,63 @@ export class RedemptionService {
   }
 
   async getCustomerRedemptions(customerId: string, pagination: PaginationParams) {
-    const { from, to } = paginationRange(pagination);
+    const offset = (pagination.page - 1) * pagination.limit;
+    const data = await query(
+      `SELECT r.*, json_build_object('name', s.name) AS stores
+       FROM redemption_requests r
+       LEFT JOIN stores s ON s.id = r.store_id
+       WHERE r.customer_id = $1
+       ORDER BY r.requested_at DESC
+       LIMIT $2 OFFSET $3`,
+      [customerId, pagination.limit, offset],
+    );
 
-    const { data, error, count } = await supabaseAdmin
-      .from("redemption_requests")
-      .select("*, stores(name)", { count: "exact" })
-      .eq("customer_id", customerId)
-      .order("requested_at", { ascending: false })
-      .range(from, to);
-
-    if (error) throw new AppError(400, error.message);
+    const total = await queryCount(
+      "SELECT COUNT(*)::text AS count FROM redemption_requests WHERE customer_id = $1",
+      [customerId],
+    );
 
     return {
-      data: data || [],
+      data,
       pagination: {
         page: pagination.page,
         limit: pagination.limit,
-        total: count || 0,
-        totalPages: Math.ceil((count || 0) / pagination.limit),
+        total,
+        totalPages: Math.ceil(total / pagination.limit),
       },
     };
   }
 
   async getStoreRedemptions(storeId: string, ownerId: string, pagination: PaginationParams) {
-    const { data: store } = await supabaseAdmin
-      .from("stores")
-      .select("id")
-      .eq("id", storeId)
-      .eq("owner_id", ownerId)
-      .single();
-
+    const store = await queryOne<{ id: string }>(
+      "SELECT id FROM stores WHERE id = $1 AND owner_id = $2",
+      [storeId, ownerId],
+    );
     if (!store) throw new NotFoundError("Store");
 
-    const { from, to } = paginationRange(pagination);
+    const offset = (pagination.page - 1) * pagination.limit;
+    const data = await query(
+      `SELECT r.*, json_build_object('name', p.name, 'username', p.username) AS profiles
+       FROM redemption_requests r
+       JOIN profiles p ON p.id = r.customer_id
+       WHERE r.store_id = $1
+       ORDER BY r.requested_at DESC
+       LIMIT $2 OFFSET $3`,
+      [storeId, pagination.limit, offset],
+    );
 
-    const { data, error, count } = await supabaseAdmin
-      .from("redemption_requests")
-      .select("*, profiles!customer_id(name, username)", { count: "exact" })
-      .eq("store_id", storeId)
-      .order("requested_at", { ascending: false })
-      .range(from, to);
-
-    if (error) throw new AppError(400, error.message);
+    const total = await queryCount(
+      "SELECT COUNT(*)::text AS count FROM redemption_requests WHERE store_id = $1",
+      [storeId],
+    );
 
     return {
-      data: data || [],
+      data,
       pagination: {
         page: pagination.page,
         limit: pagination.limit,
-        total: count || 0,
-        totalPages: Math.ceil((count || 0) / pagination.limit),
+        total,
+        totalPages: Math.ceil(total / pagination.limit),
       },
     };
   }

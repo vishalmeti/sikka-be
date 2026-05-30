@@ -7,15 +7,15 @@ const envSchema = z.object({
   NODE_ENV: z.enum(["development", "production", "test"]).default("development"),
   PORT: z.coerce.number().default(3000),
 
-  SUPABASE_URL: z.string().url(),
-  SUPABASE_ANON_KEY: z.string().min(1),
-  SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
   DATABASE_URL: z.string().min(1),
 
   RAZORPAY_KEY_ID: z.string().default(""),
   RAZORPAY_KEY_SECRET: z.string().default(""),
 
   JWT_SECRET: z.string().min(1),
+  // 1h access, 30d refresh. Override via env if you need shorter/longer.
+  JWT_ACCESS_TTL: z.string().default("1h"),
+  JWT_REFRESH_TTL: z.string().default("30d"),
 
   CORS_ORIGIN: z.string().default("*"),
 });

@@ -1,96 +1,99 @@
-import { supabaseAdmin, supabaseAuth } from "../../config";
+import { queryOne } from "../../config";
 import { AppError, ConflictError, UnauthorizedError } from "../../utils/errors";
+import {
+  hashPassword,
+  signAccessToken,
+  signRefreshToken,
+  verifyPassword,
+  verifyRefreshToken,
+} from "../../utils/auth";
+import { UserRole } from "../../types";
 
-// Supabase Auth identifies users by email, so we map each username to a
-// stable synthetic email. No mail is ever sent — the account is created
-// pre-confirmed and the password is hashed/stored by Supabase in auth.users.
-const USERNAME_EMAIL_DOMAIN = "sikka.local";
-const emailForUsername = (username: string) => `${username}@${USERNAME_EMAIL_DOMAIN}`;
+interface ProfileRow {
+  id: string;
+  username: string;
+  name: string | null;
+  phone: string | null;
+  role: UserRole;
+  fcm_token: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// Strip the password hash before returning a profile to the caller.
+const PUBLIC_COLUMNS =
+  "id, username, name, phone, role, fcm_token, created_at, updated_at";
 
 export class AuthService {
   async register(
     username: string,
     password: string,
     name: string | undefined,
-    role: "customer" | "owner"
+    role: UserRole,
   ) {
-    const email = emailForUsername(username);
+    const passwordHash = await hashPassword(password);
 
-    const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
-      email,
-      password,
-      email_confirm: true,
-      user_metadata: { username, role },
-    });
-
-    if (createErr || !created?.user) {
-      const msg = createErr?.message?.toLowerCase() ?? "";
-      if (msg.includes("already") || msg.includes("registered") || msg.includes("exists")) {
+    let profile: ProfileRow;
+    try {
+      profile = (await queryOne<ProfileRow>(
+        `INSERT INTO profiles (username, password_hash, name, role)
+         VALUES ($1, $2, $3, $4)
+         RETURNING ${PUBLIC_COLUMNS}`,
+        [username, passwordHash, name ?? null, role],
+      ))!;
+    } catch (err: unknown) {
+      // 23505 = unique_violation. Only the username index is unique on this table.
+      if ((err as { code?: string })?.code === "23505") {
         throw new ConflictError("Username already taken");
       }
-      throw new AppError(400, createErr?.message ?? "Could not create account");
+      throw new AppError(400, (err as Error).message || "Could not create account");
     }
 
-    const userId = created.user.id;
-
-    const { data: profile, error: profileErr } = await supabaseAdmin
-      .from("profiles")
-      .insert({ id: userId, username, name, role })
-      .select()
-      .single();
-
-    if (profileErr) {
-      // Roll back the orphaned auth user so the username can be retried.
-      await supabaseAdmin.auth.admin.deleteUser(userId);
-      if (profileErr.code === "23505") throw new ConflictError("Username already taken");
-      throw new AppError(400, profileErr.message);
-    }
-
-    const session = await this.passwordSignIn(email, password);
-    return { ...session, user: profile };
+    return this.issueTokens(profile);
   }
 
   async login(username: string, password: string) {
-    const email = emailForUsername(username);
-    const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
+    const row = await queryOne<ProfileRow & { password_hash: string }>(
+      `SELECT ${PUBLIC_COLUMNS}, password_hash
+       FROM profiles
+       WHERE lower(username) = lower($1)`,
+      [username],
+    );
 
-    if (error || !data.session || !data.user) {
+    if (!row || !(await verifyPassword(password, row.password_hash))) {
       throw new UnauthorizedError("Invalid username or password");
     }
 
-    const profile = await this.getProfile(data.user.id);
-    return {
-      accessToken: data.session.access_token,
-      refreshToken: data.session.refresh_token,
-      user: profile,
-    };
+    const { password_hash: _ignored, ...profile } = row;
+    return this.issueTokens(profile as ProfileRow);
   }
 
   async refreshToken(refreshToken: string) {
-    const { data, error } = await supabaseAuth.auth.refreshSession({ refresh_token: refreshToken });
-    if (error || !data.session) throw new UnauthorizedError("Invalid refresh token");
+    let payload;
+    try {
+      payload = verifyRefreshToken(refreshToken);
+    } catch {
+      throw new UnauthorizedError("Invalid refresh token");
+    }
+
+    const profile = await queryOne<ProfileRow>(
+      `SELECT ${PUBLIC_COLUMNS} FROM profiles WHERE id = $1`,
+      [payload.sub],
+    );
+
+    if (!profile) throw new UnauthorizedError("Invalid refresh token");
 
     return {
-      accessToken: data.session.access_token,
-      refreshToken: data.session.refresh_token,
+      accessToken: signAccessToken(profile.id, profile.role),
+      refreshToken: signRefreshToken(profile.id),
     };
   }
 
-  private async passwordSignIn(email: string, password: string) {
-    const { data, error } = await supabaseAuth.auth.signInWithPassword({ email, password });
-    if (error || !data.session) throw new AppError(500, "Could not establish session");
+  private issueTokens(profile: ProfileRow) {
     return {
-      accessToken: data.session.access_token,
-      refreshToken: data.session.refresh_token,
+      accessToken: signAccessToken(profile.id, profile.role),
+      refreshToken: signRefreshToken(profile.id),
+      user: profile,
     };
-  }
-
-  private async getProfile(userId: string) {
-    const { data } = await supabaseAdmin
-      .from("profiles")
-      .select("*")
-      .eq("id", userId)
-      .single();
-    return data;
   }
 }

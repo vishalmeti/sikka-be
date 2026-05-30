@@ -1,112 +1,127 @@
-import { supabaseAdmin } from "../../config";
+import { query, queryOne } from "../../config";
 import { AppError, NotFoundError, ForbiddenError } from "../../utils/errors";
 
+interface OfferRow {
+  id: string;
+  store_id: string;
+  title: string;
+  offer_type: string;
+  multiplier: string;
+  bonus_amount: string;
+  min_spend: string;
+  starts_at: string;
+  ends_at: string;
+  is_active: boolean;
+  created_at: string;
+}
+
 export class OfferService {
-  async create(ownerId: string, data: {
-    storeId: string;
-    title: string;
-    offerType: string;
-    multiplier: number;
-    bonusAmount: number;
-    minSpend: number;
-    startsAt: string;
-    endsAt: string;
-  }) {
+  async create(
+    ownerId: string,
+    data: {
+      storeId: string;
+      title: string;
+      offerType: string;
+      multiplier: number;
+      bonusAmount: number;
+      minSpend: number;
+      startsAt: string;
+      endsAt: string;
+    },
+  ) {
     await this.verifyStoreOwnership(data.storeId, ownerId);
 
-    const { data: offer, error } = await supabaseAdmin
-      .from("offers")
-      .insert({
-        store_id: data.storeId,
-        title: data.title,
-        offer_type: data.offerType,
-        multiplier: data.multiplier,
-        bonus_amount: data.bonusAmount,
-        min_spend: data.minSpend,
-        starts_at: data.startsAt,
-        ends_at: data.endsAt,
-      })
-      .select()
-      .single();
-
-    if (error) throw new AppError(400, error.message);
-    return offer;
+    try {
+      return (await queryOne<OfferRow>(
+        `INSERT INTO offers
+           (store_id, title, offer_type, multiplier, bonus_amount, min_spend, starts_at, ends_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING *`,
+        [
+          data.storeId,
+          data.title,
+          data.offerType,
+          data.multiplier,
+          data.bonusAmount,
+          data.minSpend,
+          data.startsAt,
+          data.endsAt,
+        ],
+      ))!;
+    } catch (err: unknown) {
+      throw new AppError(400, (err as Error).message);
+    }
   }
 
   async update(offerId: string, ownerId: string, updates: Record<string, unknown>) {
-    const { data: offer } = await supabaseAdmin
-      .from("offers")
-      .select("*, stores(owner_id)")
-      .eq("id", offerId)
-      .single();
-
+    const offer = await queryOne<OfferRow & { store_owner_id: string }>(
+      `SELECT o.*, s.owner_id AS store_owner_id
+       FROM offers o JOIN stores s ON s.id = o.store_id
+       WHERE o.id = $1`,
+      [offerId],
+    );
     if (!offer) throw new NotFoundError("Offer");
-    if ((offer as any).stores?.owner_id !== ownerId) throw new ForbiddenError("You don't own this store");
+    if (offer.store_owner_id !== ownerId) throw new ForbiddenError("You don't own this store");
 
-    const dbUpdates: Record<string, unknown> = {};
-    if (updates.title !== undefined) dbUpdates.title = updates.title;
-    if (updates.multiplier !== undefined) dbUpdates.multiplier = updates.multiplier;
-    if (updates.bonusAmount !== undefined) dbUpdates.bonus_amount = updates.bonusAmount;
-    if (updates.minSpend !== undefined) dbUpdates.min_spend = updates.minSpend;
-    if (updates.startsAt !== undefined) dbUpdates.starts_at = updates.startsAt;
-    if (updates.endsAt !== undefined) dbUpdates.ends_at = updates.endsAt;
-    if (updates.isActive !== undefined) dbUpdates.is_active = updates.isActive;
+    const sets: string[] = [];
+    const values: unknown[] = [];
+    const push = (col: string, val: unknown) => {
+      values.push(val);
+      sets.push(`${col} = $${values.length}`);
+    };
+    if (updates.title !== undefined) push("title", updates.title);
+    if (updates.multiplier !== undefined) push("multiplier", updates.multiplier);
+    if (updates.bonusAmount !== undefined) push("bonus_amount", updates.bonusAmount);
+    if (updates.minSpend !== undefined) push("min_spend", updates.minSpend);
+    if (updates.startsAt !== undefined) push("starts_at", updates.startsAt);
+    if (updates.endsAt !== undefined) push("ends_at", updates.endsAt);
+    if (updates.isActive !== undefined) push("is_active", updates.isActive);
 
-    const { data: updated, error } = await supabaseAdmin
-      .from("offers")
-      .update(dbUpdates)
-      .eq("id", offerId)
-      .select()
-      .single();
+    if (sets.length === 0) return offer;
 
-    if (error) throw new AppError(400, error.message);
+    values.push(offerId);
+    const updated = await queryOne<OfferRow>(
+      `UPDATE offers SET ${sets.join(", ")} WHERE id = $${values.length} RETURNING *`,
+      values,
+    );
     return updated;
   }
 
   async delete(offerId: string, ownerId: string) {
-    const { data: offer } = await supabaseAdmin
-      .from("offers")
-      .select("*, stores(owner_id)")
-      .eq("id", offerId)
-      .single();
-
+    const offer = await queryOne<{ store_owner_id: string }>(
+      `SELECT s.owner_id AS store_owner_id
+       FROM offers o JOIN stores s ON s.id = o.store_id
+       WHERE o.id = $1`,
+      [offerId],
+    );
     if (!offer) throw new NotFoundError("Offer");
-    if ((offer as any).stores?.owner_id !== ownerId) throw new ForbiddenError("You don't own this store");
+    if (offer.store_owner_id !== ownerId) throw new ForbiddenError("You don't own this store");
 
-    const { error } = await supabaseAdmin.from("offers").delete().eq("id", offerId);
-    if (error) throw new AppError(400, error.message);
-
+    await query("DELETE FROM offers WHERE id = $1", [offerId]);
     return { message: "Offer deleted" };
   }
 
   async getStoreOffers(storeId: string, activeOnly = false) {
-    let query = supabaseAdmin
-      .from("offers")
-      .select("*")
-      .eq("store_id", storeId)
-      .order("created_at", { ascending: false });
-
     if (activeOnly) {
       const now = new Date().toISOString();
-      query = query
-        .eq("is_active", true)
-        .lte("starts_at", now)
-        .gte("ends_at", now);
+      return query<OfferRow>(
+        `SELECT * FROM offers
+         WHERE store_id = $1 AND is_active = true AND starts_at <= $2 AND ends_at >= $2
+         ORDER BY created_at DESC`,
+        [storeId, now],
+      );
     }
-
-    const { data, error } = await query;
-    if (error) throw new AppError(400, error.message);
-    return data || [];
+    return query<OfferRow>(
+      "SELECT * FROM offers WHERE store_id = $1 ORDER BY created_at DESC",
+      [storeId],
+    );
   }
 
   private async verifyStoreOwnership(storeId: string, ownerId: string) {
-    const { data } = await supabaseAdmin
-      .from("stores")
-      .select("id")
-      .eq("id", storeId)
-      .eq("owner_id", ownerId)
-      .single();
-
-    if (!data) throw new ForbiddenError("You don't own this store");
+    const store = await queryOne(
+      "SELECT id FROM stores WHERE id = $1 AND owner_id = $2",
+      [storeId, ownerId],
+    );
+    if (!store) throw new ForbiddenError("You don't own this store");
   }
 }

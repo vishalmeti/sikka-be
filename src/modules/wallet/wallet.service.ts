@@ -1,112 +1,150 @@
-import { supabaseAdmin, REDEEM_RATE } from "../../config";
-import { AppError, NotFoundError } from "../../utils/errors";
+import { query, queryOne, REDEEM_RATE } from "../../config";
+import { NotFoundError } from "../../utils/errors";
 import { tierProgress } from "../../utils/tier";
+
+interface WalletRow {
+  id: string;
+  store_id: string;
+  store_name: string | null;
+  balance: string;
+  total_earned: string;
+  tier: string;
+  streak_days: number;
+  last_visit_date: string | null;
+}
 
 export class WalletService {
   async getCustomerWallets(customerId: string) {
-    const { data, error } = await supabaseAdmin
-      .from("coin_wallets")
-      .select("*, stores(id, name)")
-      .eq("customer_id", customerId)
-      .order("updated_at", { ascending: false });
+    const rows = await query<WalletRow>(
+      `SELECT w.id, w.store_id, s.name AS store_name, w.balance, w.total_earned,
+              w.tier, w.streak_days, w.last_visit_date
+       FROM coin_wallets w
+       LEFT JOIN stores s ON s.id = w.store_id
+       WHERE w.customer_id = $1
+       ORDER BY w.updated_at DESC`,
+      [customerId],
+    );
 
-    if (error) throw new AppError(400, error.message);
-
-    return (data || []).map((w: any) => ({
+    return rows.map((w) => ({
       id: w.id,
       storeId: w.store_id,
-      storeName: w.stores?.name,
-      balance: w.balance,
-      totalEarned: w.total_earned,
+      storeName: w.store_name,
+      balance: Number(w.balance),
+      totalEarned: Number(w.total_earned),
       tier: w.tier,
-      tierProgress: tierProgress(w.total_earned),
+      tierProgress: tierProgress(Number(w.total_earned)),
       streakDays: w.streak_days,
       lastVisitDate: w.last_visit_date,
     }));
   }
 
   async getWalletForStore(customerId: string, storeId: string) {
-    const { data, error } = await supabaseAdmin
-      .from("coin_wallets")
-      .select("*, stores(id, name)")
-      .eq("customer_id", customerId)
-      .eq("store_id", storeId)
-      .single();
+    const data = await queryOne<WalletRow>(
+      `SELECT w.id, w.store_id, s.name AS store_name, w.balance, w.total_earned,
+              w.tier, w.streak_days, w.last_visit_date
+       FROM coin_wallets w
+       LEFT JOIN stores s ON s.id = w.store_id
+       WHERE w.customer_id = $1 AND w.store_id = $2`,
+      [customerId, storeId],
+    );
 
-    if (error || !data) throw new NotFoundError("Wallet");
+    if (!data) throw new NotFoundError("Wallet");
 
     return {
       id: data.id,
       storeId: data.store_id,
-      storeName: (data as any).stores?.name,
-      balance: data.balance,
-      totalEarned: data.total_earned,
+      storeName: data.store_name,
+      balance: Number(data.balance),
+      totalEarned: Number(data.total_earned),
       tier: data.tier,
-      tierProgress: tierProgress(data.total_earned),
+      tierProgress: tierProgress(Number(data.total_earned)),
       streakDays: data.streak_days,
       lastVisitDate: data.last_visit_date,
     };
   }
 
   async getDashboard(customerId: string) {
-    const { data: wallets } = await supabaseAdmin
-      .from("coin_wallets")
-      .select("store_id, balance, total_earned, tier, streak_days, stores(id, name)")
-      .eq("customer_id", customerId)
-      .order("balance", { ascending: false });
+    const wallets = await query<{
+      store_id: string;
+      store_name: string | null;
+      balance: string;
+      total_earned: string;
+      tier: string;
+      streak_days: number;
+      visits: string;
+    }>(
+      `SELECT w.store_id, s.name AS store_name, w.balance, w.total_earned,
+              w.tier, w.streak_days,
+              COALESCE((
+                SELECT COUNT(*) FROM transactions t
+                WHERE t.customer_id = w.customer_id
+                  AND t.store_id = w.store_id
+                  AND t.status = 'confirmed'
+              ), 0)::text AS visits
+       FROM coin_wallets w
+       LEFT JOIN stores s ON s.id = w.store_id
+       WHERE w.customer_id = $1
+       ORDER BY w.balance DESC`,
+      [customerId],
+    );
 
-    const totalCoins = (wallets || []).reduce((sum: number, w: any) => sum + Number(w.balance), 0);
-    const totalEarned = (wallets || []).reduce((sum: number, w: any) => sum + Number(w.total_earned), 0);
-    const maxStreak = Math.max(0, ...(wallets || []).map((w: any) => w.streak_days));
+    const totalCoins = wallets.reduce((sum, w) => sum + Number(w.balance), 0);
+    const totalEarned = wallets.reduce((sum, w) => sum + Number(w.total_earned), 0);
+    const maxStreak = wallets.reduce((m, w) => Math.max(m, w.streak_days), 0);
 
-    const { data: profile } = await supabaseAdmin
-      .from("profiles")
-      .select("name")
-      .eq("id", customerId)
-      .single();
+    const profile = await queryOne<{ name: string | null }>(
+      "SELECT name FROM profiles WHERE id = $1",
+      [customerId],
+    );
 
-    // Visit count per store = confirmed transactions, tallied in app code
-    // (Supabase JS has no GROUP BY); fine for MVP transaction volumes.
-    const { data: confirmedTx } = await supabaseAdmin
-      .from("transactions")
-      .select("store_id")
-      .eq("customer_id", customerId)
-      .eq("status", "confirmed");
+    const recentTx = await query<{
+      id: string;
+      amount: string;
+      coins_earned: string;
+      status: string;
+      created_at: string;
+      store_name: string | null;
+    }>(
+      `SELECT t.id, t.amount, t.coins_earned, t.status, t.created_at, s.name AS store_name
+       FROM transactions t
+       LEFT JOIN stores s ON s.id = t.store_id
+       WHERE t.customer_id = $1 AND t.status = 'confirmed'
+       ORDER BY t.created_at DESC
+       LIMIT 10`,
+      [customerId],
+    );
 
-    const visitsByStore = new Map<string, number>();
-    for (const tx of confirmedTx || []) {
-      visitsByStore.set(tx.store_id, (visitsByStore.get(tx.store_id) || 0) + 1);
-    }
-
-    const { data: recentTx } = await supabaseAdmin
-      .from("transactions")
-      .select("id, amount, coins_earned, status, created_at, stores(name)")
-      .eq("customer_id", customerId)
-      .eq("status", "confirmed")
-      .order("created_at", { ascending: false })
-      .limit(10);
-
-    const { data: recentRedemptions } = await supabaseAdmin
-      .from("redemption_requests")
-      .select("id, coins_to_redeem, rupee_value, status, requested_at, stores(name)")
-      .eq("customer_id", customerId)
-      .order("requested_at", { ascending: false })
-      .limit(5);
+    const recentRedemptions = await query<{
+      id: string;
+      coins_to_redeem: string;
+      rupee_value: string;
+      status: string;
+      requested_at: string;
+      store_name: string | null;
+    }>(
+      `SELECT r.id, r.coins_to_redeem, r.rupee_value, r.status, r.requested_at, s.name AS store_name
+       FROM redemption_requests r
+       LEFT JOIN stores s ON s.id = r.store_id
+       WHERE r.customer_id = $1
+       ORDER BY r.requested_at DESC
+       LIMIT 5`,
+      [customerId],
+    );
 
     const activity = [
-      ...(recentTx || []).map((tx: any) => ({
+      ...recentTx.map((tx) => ({
         id: tx.id,
         kind: "earn" as const,
-        storeName: tx.stores?.name,
-        coinDelta: tx.coins_earned,
+        storeName: tx.store_name,
+        coinDelta: Number(tx.coins_earned),
         label: `₹${tx.amount} spent`,
         timestamp: tx.created_at,
       })),
-      ...(recentRedemptions || []).map((r: any) => ({
+      ...recentRedemptions.map((r) => ({
         id: r.id,
         kind: "redeem" as const,
-        storeName: r.stores?.name,
-        coinDelta: r.coins_to_redeem,
+        storeName: r.store_name,
+        coinDelta: Number(r.coins_to_redeem),
         label: `₹${r.rupee_value} discount`,
         timestamp: r.requested_at,
       })),
@@ -119,14 +157,14 @@ export class WalletService {
       overallProgress: tierProgress(totalEarned),
       redeemRate: REDEEM_RATE,
       streakDays: maxStreak,
-      stores: (wallets || []).map((w: any) => ({
+      stores: wallets.map((w) => ({
         id: w.store_id,
-        name: w.stores?.name,
-        coins: w.balance,
-        totalEarned: w.total_earned,
+        name: w.store_name,
+        coins: Number(w.balance),
+        totalEarned: Number(w.total_earned),
         tier: w.tier,
-        tierProgress: tierProgress(w.total_earned),
-        visits: visitsByStore.get(w.store_id) || 0,
+        tierProgress: tierProgress(Number(w.total_earned)),
+        visits: Number(w.visits),
       })),
       activity: activity.slice(0, 10),
     };

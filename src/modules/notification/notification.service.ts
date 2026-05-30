@@ -1,81 +1,86 @@
-import { supabaseAdmin } from "../../config";
-import { AppError, NotFoundError } from "../../utils/errors";
+import { query, queryOne, queryCount } from "../../config";
+import { NotFoundError } from "../../utils/errors";
 import { NotificationType, PaginationParams } from "../../types";
-import { paginationRange } from "../../utils/pagination";
+
+interface NotificationRow {
+  id: string;
+  user_id: string;
+  title: string;
+  body: string;
+  type: NotificationType;
+  reference_id: string | null;
+  is_read: boolean;
+  created_at: string;
+}
 
 export class NotificationService {
-  async create(userId: string, data: {
-    title: string;
-    body: string;
-    type: NotificationType;
-    referenceId?: string;
-  }) {
-    const { error } = await supabaseAdmin.from("notifications").insert({
-      user_id: userId,
-      title: data.title,
-      body: data.body,
-      type: data.type,
-      reference_id: data.referenceId,
-    });
-
-    if (error) console.error("Failed to create notification:", error.message);
+  async create(
+    userId: string,
+    data: { title: string; body: string; type: NotificationType; referenceId?: string },
+  ) {
+    try {
+      await query(
+        `INSERT INTO notifications (user_id, title, body, type, reference_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [userId, data.title, data.body, data.type, data.referenceId ?? null],
+      );
+    } catch (err: unknown) {
+      // Notifications are best-effort — log and swallow so we don't block the
+      // operation that triggered them.
+      console.error("Failed to create notification:", (err as Error).message);
+    }
   }
 
   async getUserNotifications(userId: string, pagination: PaginationParams) {
-    const { from, to } = paginationRange(pagination);
+    const offset = (pagination.page - 1) * pagination.limit;
+    const data = await query<NotificationRow>(
+      `SELECT * FROM notifications
+       WHERE user_id = $1
+       ORDER BY created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [userId, pagination.limit, offset],
+    );
 
-    const { data, error, count } = await supabaseAdmin
-      .from("notifications")
-      .select("*", { count: "exact" })
-      .eq("user_id", userId)
-      .order("created_at", { ascending: false })
-      .range(from, to);
-
-    if (error) throw new AppError(400, error.message);
+    const total = await queryCount(
+      "SELECT COUNT(*)::text AS count FROM notifications WHERE user_id = $1",
+      [userId],
+    );
 
     return {
-      data: data || [],
+      data,
       pagination: {
         page: pagination.page,
         limit: pagination.limit,
-        total: count || 0,
-        totalPages: Math.ceil((count || 0) / pagination.limit),
+        total,
+        totalPages: Math.ceil(total / pagination.limit),
       },
     };
   }
 
   async getUnreadCount(userId: string) {
-    const { count, error } = await supabaseAdmin
-      .from("notifications")
-      .select("*", { count: "exact", head: true })
-      .eq("user_id", userId)
-      .eq("is_read", false);
-
-    if (error) throw new AppError(400, error.message);
-    return { unreadCount: count || 0 };
+    const unreadCount = await queryCount(
+      "SELECT COUNT(*)::text AS count FROM notifications WHERE user_id = $1 AND is_read = false",
+      [userId],
+    );
+    return { unreadCount };
   }
 
   async markAsRead(notificationId: string, userId: string) {
-    const { data, error } = await supabaseAdmin
-      .from("notifications")
-      .update({ is_read: true })
-      .eq("id", notificationId)
-      .eq("user_id", userId)
-      .select()
-      .single();
-
-    if (error || !data) throw new NotFoundError("Notification");
-    return data;
+    const row = await queryOne<NotificationRow>(
+      `UPDATE notifications SET is_read = true
+       WHERE id = $1 AND user_id = $2
+       RETURNING *`,
+      [notificationId, userId],
+    );
+    if (!row) throw new NotFoundError("Notification");
+    return row;
   }
 
   async markAllAsRead(userId: string) {
-    const { error } = await supabaseAdmin
-      .from("notifications")
-      .update({ is_read: true })
-      .eq("user_id", userId)
-      .eq("is_read", false);
-
-    if (error) throw new AppError(400, error.message);
+    await query(
+      "UPDATE notifications SET is_read = true WHERE user_id = $1 AND is_read = false",
+      [userId],
+    );
     return { message: "All notifications marked as read" };
   }
 }

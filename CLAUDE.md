@@ -2,24 +2,25 @@
 
 ## Stack
 - Node.js + Express 4 + TypeScript (strict)
-- Supabase (Postgres + Auth) via `@supabase/supabase-js`
+- Postgres via `pg` (raw SQL, no ORM); pool exposed from `src/config/db.ts`
+- Local JWT auth: bcryptjs for password hashing, jsonwebtoken for access/refresh tokens
 - Razorpay for payment processing
 - Zod for request validation
 - Docker for deployment
 
 ## Architecture
 ```
-Route → Controller → Service → Supabase
+Route → Controller → Service → pg pool
 ```
 - **Routes**: define endpoints + attach middleware (auth, validation)
 - **Controllers**: extract request data, delegate to service, format response
-- **Services**: business logic, Supabase queries, cross-module coordination
-- **Middleware**: auth (JWT via Supabase), validation (Zod), error handling
+- **Services**: business logic, pg queries via `query`/`queryOne`/`withTx` helpers from `config`
+- **Middleware**: auth (verifies JWT from `Authorization: Bearer …`), validation (Zod), error handling
 
 ## Project Structure
 ```
 src/
-  config/         # env validation, Supabase client, business constants
+  config/         # env validation, pg pool + query helpers, business constants
   middleware/     # auth, errorHandler, validate
   modules/        # feature modules (auth, profile, store, transaction, wallet, redemption, offer, notification)
     <module>/
@@ -66,4 +67,10 @@ All under `/api/`:
 - `PUT /notifications/read-all` — mark all read
 
 ## Environment
-Copy `.env.example` → `.env` and fill in Supabase + Razorpay credentials.
+Copy `.env.example` → `.env` and fill in `DATABASE_URL`, `JWT_SECRET`, Razorpay credentials.
+
+## Database
+- Migrations: `npm run db:migrate` (apply) / `db:rollback` / `db:status` / `db:new <name>`
+- Migration files in `migrations/` use `-- +migrate Up` / `-- +migrate Down` markers
+- Seed: `npm run db:seed` populates a demo customer (`vishalmeti` / `sikka123`) and owner (`sikka_demo_owner` / `sikka123`) with three stores
+- Schema reference: `docs/ER_diagrams.md` (note: the doc still describes the Supabase auth.users FK and RLS policies — the in-repo schema in `migrations/000_initial_schema.sql` is the source of truth)

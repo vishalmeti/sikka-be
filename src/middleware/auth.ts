@@ -1,12 +1,12 @@
 import { Response, NextFunction } from "express";
-import { supabaseAdmin } from "../config";
 import { AuthenticatedRequest, UserRole } from "../types";
 import { UnauthorizedError, ForbiddenError } from "../utils/errors";
+import { verifyAccessToken } from "../utils/auth";
 
 export async function authenticate(
   req: AuthenticatedRequest,
   _res: Response,
-  next: NextFunction
+  next: NextFunction,
 ): Promise<void> {
   try {
     const header = req.headers.authorization;
@@ -15,24 +15,16 @@ export async function authenticate(
     }
 
     const token = header.slice(7);
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
 
-    if (error || !data.user) {
+    let payload;
+    try {
+      payload = verifyAccessToken(token);
+    } catch {
       throw new UnauthorizedError("Invalid or expired token");
     }
 
-    const { data: profile } = await supabaseAdmin
-      .from("profiles")
-      .select("role")
-      .eq("id", data.user.id)
-      .single();
-
-    if (!profile) {
-      throw new UnauthorizedError("User profile not found");
-    }
-
-    req.userId = data.user.id;
-    req.userRole = profile.role as UserRole;
+    req.userId = payload.sub;
+    req.userRole = payload.role;
     next();
   } catch (err) {
     next(err);

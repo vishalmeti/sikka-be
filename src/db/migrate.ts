@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { Client } from "pg";
+import { sslFromConnectionString } from "../config/ssl";
 
 const MIGRATIONS_DIR = resolve(__dirname, "../../migrations");
 const FILE_RE = /^(\d+)_(.+)\.sql$/;
@@ -78,8 +79,7 @@ function makeClient(): Client {
   if (!connectionString) {
     throw new Error("DATABASE_URL is not set. Add it to .env before running migrations.");
   }
-  // Supabase requires TLS; the direct host's cert chain isn't worth verifying for a CLI.
-  return new Client({ connectionString, ssl: { rejectUnauthorized: false } });
+  return new Client({ connectionString, ssl: sslFromConnectionString(connectionString) });
 }
 
 async function ensureMigrationsTable(client: Client): Promise<void> {

@@ -5,17 +5,15 @@
  * Idempotent: re-running updates the same rows instead of duplicating, because
  * every seeded row uses a deterministic UUID (uuid v5 of a stable key).
  *
- * It uses the service-role client, which bypasses RLS and can create the auth
- * users it needs. Run with:  npm run db:seed
+ * Run with:  npm run db:seed
  */
 import "dotenv/config";
 import { v5 as uuidv5 } from "uuid";
-import { supabaseAdmin } from "../config";
+import bcrypt from "bcryptjs";
+import { pool, query, queryOne } from "../config";
 
 // The library's DNS namespace gives stable UUIDs across runs from a string key.
 const sid = (key: string) => uuidv5(`sikka-seed:${key}`, uuidv5.DNS);
-
-const emailFor = (username: string) => `${username}@sikka.local`;
 
 const CUSTOMER = { username: "vishalmeti", name: "Vishal Meti", password: "sikka123" };
 const OWNER = { username: "sikka_demo_owner", name: "Sikka Demo Owner", password: "sikka123" };
@@ -69,125 +67,124 @@ const STORES: StoreSpec[] = [
   },
 ];
 
-async function findUserByEmail(email: string) {
-  const target = email.toLowerCase();
-  for (let page = 1; page <= 20; page++) {
-    const { data, error } = await supabaseAdmin.auth.admin.listUsers({ page, perPage: 1000 });
-    if (error) throw error;
-    const found = data.users.find((u) => (u.email ?? "").toLowerCase() === target);
-    if (found) return found;
-    if (data.users.length < 1000) return null;
-  }
-  return null;
-}
-
-async function ensureUser(spec: { username: string; password: string }, role: string) {
-  const email = emailFor(spec.username);
-  const existing = await findUserByEmail(email);
+async function ensureUser(spec: { username: string; name: string; password: string }, role: string) {
+  const existing = await queryOne<{ id: string }>(
+    "SELECT id FROM profiles WHERE lower(username) = lower($1)",
+    [spec.username],
+  );
   if (existing) return { id: existing.id, created: false };
 
-  const { data, error } = await supabaseAdmin.auth.admin.createUser({
-    email,
-    password: spec.password,
-    email_confirm: true,
-    user_metadata: { username: spec.username, role },
-  });
-  if (error || !data.user) throw error ?? new Error(`Could not create auth user ${spec.username}`);
-  return { id: data.user.id, created: true };
-}
-
-async function ensureProfile(id: string, username: string, name: string, role: string) {
-  const { error } = await supabaseAdmin
-    .from("profiles")
-    .upsert({ id, username, name, role }, { onConflict: "id" });
-  if (error) throw error;
-}
-
-async function upsert(table: string, rows: any[], onConflict: string) {
-  if (rows.length === 0) return;
-  const { error } = await supabaseAdmin.from(table).upsert(rows, { onConflict });
-  if (error) throw new Error(`Upsert into ${table} failed: ${error.message}`);
+  const id = sid(`profile-${spec.username}`);
+  const hash = await bcrypt.hash(spec.password, 10);
+  await query(
+    `INSERT INTO profiles (id, username, password_hash, name, role)
+     VALUES ($1, $2, $3, $4, $5)`,
+    [id, spec.username, hash, spec.name, role],
+  );
+  return { id, created: true };
 }
 
 async function main() {
   console.log("Seeding demo dashboard data...\n");
 
   const owner = await ensureUser(OWNER, "owner");
-  await ensureProfile(owner.id, OWNER.username, OWNER.name, "owner");
   console.log(`Owner  : ${OWNER.username} (${owner.created ? "created" : "existing"})`);
 
   const customer = await ensureUser(CUSTOMER, "customer");
-  await ensureProfile(customer.id, CUSTOMER.username, CUSTOMER.name, "customer");
   console.log(`Customer: ${CUSTOMER.username} (${customer.created ? "created" : "existing"})`);
 
-  await upsert(
-    "stores",
-    STORES.map((s) => ({
-      id: sid(s.key),
-      owner_id: owner.id,
-      name: s.name,
-      upi_id: s.upi,
-      is_active: true,
-    })),
-    "id"
-  );
-
-  await upsert(
-    "coin_wallets",
-    STORES.map((s) => ({
-      id: sid(`wallet-${s.key}`),
-      customer_id: customer.id,
-      store_id: sid(s.key),
-      balance: s.wallet.balance,
-      total_earned: s.wallet.totalEarned,
-      streak_days: s.wallet.streak,
-      last_visit_date: dateDaysAgo(s.wallet.lastVisit),
-      tier: s.wallet.tier,
-    })),
-    "customer_id,store_id"
-  );
-
-  const txRows: any[] = [];
   for (const s of STORES) {
-    s.txs.forEach((t, i) => {
+    await query(
+      `INSERT INTO stores (id, owner_id, name, upi_id, is_active)
+       VALUES ($1, $2, $3, $4, true)
+       ON CONFLICT (id) DO UPDATE
+         SET name = EXCLUDED.name, upi_id = EXCLUDED.upi_id, is_active = EXCLUDED.is_active`,
+      [sid(s.key), owner.id, s.name, s.upi],
+    );
+
+    await query(
+      `INSERT INTO coin_wallets
+         (id, customer_id, store_id, balance, total_earned, streak_days, last_visit_date, tier)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+       ON CONFLICT (customer_id, store_id) DO UPDATE
+         SET balance = EXCLUDED.balance,
+             total_earned = EXCLUDED.total_earned,
+             streak_days = EXCLUDED.streak_days,
+             last_visit_date = EXCLUDED.last_visit_date,
+             tier = EXCLUDED.tier`,
+      [
+        sid(`wallet-${s.key}`),
+        customer.id,
+        sid(s.key),
+        s.wallet.balance,
+        s.wallet.totalEarned,
+        s.wallet.streak,
+        dateDaysAgo(s.wallet.lastVisit),
+        s.wallet.tier,
+      ],
+    );
+
+    for (let i = 0; i < s.txs.length; i++) {
+      const t = s.txs[i];
       const key = `${s.key}-tx-${i}`;
-      txRows.push({
-        id: sid(key),
-        customer_id: customer.id,
-        store_id: sid(s.key),
-        amount: t.amt,
-        coins_earned: Math.round(t.amt * 0.05),
-        razorpay_order_id: `order_seed_${key}`,
-        razorpay_payment_id: `pay_seed_${key}`,
-        status: "confirmed",
-        created_at: isoDaysAgo(t.d),
-      });
-    });
-  }
-  await upsert("transactions", txRows, "id");
+      await query(
+        `INSERT INTO transactions
+           (id, customer_id, store_id, amount, coins_earned,
+            razorpay_order_id, razorpay_payment_id, status, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'confirmed', $8)
+         ON CONFLICT (id) DO UPDATE
+           SET amount = EXCLUDED.amount,
+               coins_earned = EXCLUDED.coins_earned,
+               status = EXCLUDED.status,
+               created_at = EXCLUDED.created_at`,
+        [
+          sid(key),
+          customer.id,
+          sid(s.key),
+          t.amt,
+          Math.round(t.amt * 0.05),
+          `order_seed_${key}`,
+          `pay_seed_${key}`,
+          isoDaysAgo(t.d),
+        ],
+      );
+    }
 
-  const redRows: any[] = [];
-  for (const s of STORES) {
-    s.redemptions.forEach((r, i) => {
-      redRows.push({
-        id: sid(`${s.key}-red-${i}`),
-        customer_id: customer.id,
-        store_id: sid(s.key),
-        coins_to_redeem: r.coins,
-        rupee_value: r.rupee,
-        bill_amount: r.bill,
-        status: "approved",
-        requested_at: isoDaysAgo(r.d),
-        resolved_at: isoDaysAgo(r.d),
-        resolved_by: owner.id,
-      });
-    });
+    for (let i = 0; i < s.redemptions.length; i++) {
+      const r = s.redemptions[i];
+      const key = `${s.key}-red-${i}`;
+      await query(
+        `INSERT INTO redemption_requests
+           (id, customer_id, store_id, coins_to_redeem, rupee_value, bill_amount,
+            status, requested_at, resolved_at, resolved_by)
+         VALUES ($1, $2, $3, $4, $5, $6, 'approved', $7, $7, $8)
+         ON CONFLICT (id) DO UPDATE
+           SET coins_to_redeem = EXCLUDED.coins_to_redeem,
+               rupee_value = EXCLUDED.rupee_value,
+               bill_amount = EXCLUDED.bill_amount,
+               status = EXCLUDED.status,
+               requested_at = EXCLUDED.requested_at,
+               resolved_at = EXCLUDED.resolved_at,
+               resolved_by = EXCLUDED.resolved_by`,
+        [
+          sid(key),
+          customer.id,
+          sid(s.key),
+          r.coins,
+          r.rupee,
+          r.bill,
+          isoDaysAgo(r.d),
+          owner.id,
+        ],
+      );
+    }
   }
-  await upsert("redemption_requests", redRows, "id");
 
   const totalCoins = STORES.reduce((sum, s) => sum + s.wallet.balance, 0);
+  const txCount = STORES.reduce((sum, s) => sum + s.txs.length, 0);
+  const redCount = STORES.reduce((sum, s) => sum + s.redemptions.length, 0);
   console.log(
-    `\nSeeded ${STORES.length} stores, ${txRows.length} transactions, ${redRows.length} redemption(s).`
+    `\nSeeded ${STORES.length} stores, ${txCount} transactions, ${redCount} redemption(s).`,
   );
   console.log(`Total balance on dashboard: ${totalCoins} coins.`);
   if (customer.created) {
@@ -198,8 +195,10 @@ async function main() {
 }
 
 main()
+  .then(() => pool.end())
   .then(() => process.exit(0))
-  .catch((err) => {
+  .catch(async (err) => {
     console.error("\nSeed failed:", err instanceof Error ? err.message : err);
+    await pool.end().catch(() => {});
     process.exit(1);
   });
