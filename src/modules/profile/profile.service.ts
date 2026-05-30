@@ -2,7 +2,7 @@ import { query, queryOne } from "../../config";
 import { NotFoundError, AppError } from "../../utils/errors";
 
 const PUBLIC_COLUMNS =
-  "id, username, name, phone, role, fcm_token, created_at, updated_at";
+  "id, username, name, phone, phone_verified_at, role, fcm_token, created_at, updated_at";
 
 export class ProfileService {
   async getProfile(userId: string) {

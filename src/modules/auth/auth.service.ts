@@ -14,6 +14,7 @@ interface ProfileRow {
   username: string;
   name: string | null;
   phone: string | null;
+  phone_verified_at: string | null;
   role: UserRole;
   fcm_token: string | null;
   created_at: string;
@@ -22,7 +23,7 @@ interface ProfileRow {
 
 // Strip the password hash before returning a profile to the caller.
 const PUBLIC_COLUMNS =
-  "id, username, name, phone, role, fcm_token, created_at, updated_at";
+  "id, username, name, phone, phone_verified_at, role, fcm_token, created_at, updated_at";
 
 export class AuthService {
   async register(
